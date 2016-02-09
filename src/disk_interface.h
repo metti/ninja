@@ -19,7 +19,14 @@
 #include <string>
 using namespace std;
 
+#ifdef _WIN32
+#include "win32port.h"
+#else
+#include <stdint.h>
+#endif
+
 #include "timestamp.h"
+
 
 /// Interface for reading files from disk.  See DiskInterface for details.
 /// This base offers the minimum interface needed just to read files.
@@ -39,11 +46,22 @@ struct FileReader {
                           string* err) = 0;
 };
 
+/// Interface for hashing files from disk.
+struct FileHasher {
+  typedef uint64_t Hash;
+
+  /// Read file and store hash.  On success, return Okay.
+  /// On error, return another Status and fill |err|.
+  virtual FileReader::Status HashFile(const string& path, Hash *hash,
+                                      string* err) = 0;
+};
+
+
 /// Interface for accessing the disk.
 ///
 /// Abstract so it can be mocked out for tests.  The real implementation
 /// is RealDiskInterface.
-struct DiskInterface: public FileReader {
+struct DiskInterface: public FileReader, public FileHasher {
   /// stat() a file, returning the mtime, or 0 if missing and -1 on
   /// other errors.
   virtual TimeStamp Stat(const string& path, string* err) const = 0;
@@ -61,11 +79,6 @@ struct DiskInterface: public FileReader {
   ///          1 if the file does not exist, and
   ///          -1 if an error occurs.
   virtual int RemoveFile(const string& path) = 0;
-
-  /// the hash type returned for HashFile()
-  typedef unsigned int hash_t;
-  /// Hash a file's content
-  hash_t HashFile(const string&, string* err);
 
   /// Create all the parent directories for path; like mkdir -p
   /// `basename path`.
@@ -85,7 +98,7 @@ struct RealDiskInterface : public DiskInterface {
   virtual bool WriteFile(const string& path, const string& contents);
   virtual Status ReadFile(const string& path, string* contents, string* err);
   virtual int RemoveFile(const string& path);
-
+  virtual Status HashFile(const string& path, Hash *hash, string* err);
   /// Whether stat information can be cached.  Only has an effect on Windows.
   void AllowStatCache(bool allow);
 

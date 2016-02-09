@@ -125,6 +125,9 @@ struct State {
 
   BindingEnv bindings_;
   vector<Node*> defaults_;
+
+  /// Seen a |hash_input| rule.  Builder might need the HashLog.
+  bool need_hash_log_;
 };
 
 #endif  // NINJA_STATE_H_

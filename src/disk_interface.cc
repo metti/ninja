@@ -32,6 +32,8 @@
 #include "metrics.h"
 #include "util.h"
 
+#include "PMurHash.h"
+
 namespace {
 
 string DirName(const string& path) {
@@ -152,19 +154,6 @@ bool DiskInterface::MakeDirs(const string& path) {
   return MakeDir(dir);
 }
 
-DiskInterface::hash_t DiskInterface::HashFile(const string& path, string* err) {
-  METRIC_RECORD("hash_input");
-  string content;
-  switch (ReadFile(path, &content, err)) {
-  case DiskInterface::NotFound:
-    err->clear();
-  case DiskInterface::Okay:
-    return MurmurHash2(content.c_str(), content.size());
-  default:
-    return 0;
-  }
-}
-
 // RealDiskInterface -----------------------------------------------------------
 
 TimeStamp RealDiskInterface::Stat(const string& path, string* err) const {
@@ -252,6 +241,37 @@ FileReader::Status RealDiskInterface::ReadFile(const string& path,
   case -ENOENT: return NotFound;
   default:      return OtherError;
   }
+}
+
+FileReader::Status RealDiskInterface::HashFile(const string& path,
+                                               Hash* hash,
+                                               string* err) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    err->assign(strerror(errno));
+    if (errno == ENOENT)
+      return NotFound;
+    else
+      return OtherError;
+  }
+
+  char buf[64 << 10];
+  MH_UINT32 h1 = 0;
+  MH_UINT32 carry = 0;
+  size_t total_len = 0;
+  size_t len;
+  while ((len = fread(buf, 1, sizeof(buf), f)) > 0) {
+    PMurHash32_Process(&h1, &carry, buf, len);
+    total_len += len;
+  }
+  if (ferror(f)) {
+    err->assign(strerror(errno));  // XXX errno?
+    fclose(f);
+    return OtherError;
+  }
+  *hash = PMurHash32_Result(h1, carry, total_len);
+  fclose(f);
+  return Okay;
 }
 
 int RealDiskInterface::RemoveFile(const string& path) {

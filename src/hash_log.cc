@@ -23,484 +23,388 @@
 #include <unistd.h>
 #endif
 
+#include <iostream>
+#include <algorithm>
+
 #include "disk_interface.h"
 #include "graph.h"
+#include "state.h"
 #include "hash_map.h"
 #include "metrics.h"
 
-using namespace std;
+/// The file banner in the persisted hash log.
+static const char kFileSignature[] = "# ninjahashlog\n";
+static const int kCurrentVersion = 6;
+const unsigned kMaxPathSize = (1 << 19) - 1;
 
-/// the default file name for the persisted hash log
-const char     kHashLogFileName[] = ".ninja_hashes";
-
-/// the file banner in the persisted hash log
-static const char     kFileSignature[] = "# ninjahashlog\n";
-
-/// the current hash log version, the datatype sizes
-/// for time stamps and hashes and the maximum file path length
-/// to detect incompatibilities
-static const uint32_t kCurrentVersion  = 4;
-static const uint32_t kHash_TSize = sizeof(HashLog::hash_t);
-static const uint32_t kTimestampSize = sizeof(TimeStamp);
-static const uint32_t kMaxFileNameLength = 1024;
+HashLog::HashLog(FileHasher *hasher)
+  : next_id_(0), file_(NULL), hasher_(hasher), needs_recompaction_(false)
+{}
 
 HashLog::~HashLog() {
   Close();
 }
 
-bool HashLog::PutHash(const string &path, const hash_t hash,
-                      const TimeStamp mtime, const hash_variant variant,
-                      string* err) {
-  if (file_ == NULL) {
-    if (!Load(err)) {
-      return false;
-    }
-  }
+void HashLog::Close() {
+  if (file_)
+    fclose(file_);
+  file_ = NULL;
+}
 
-  // don't put any entry of too long paths
-  if (path.size() > kMaxFileNameLength) {
-    // as this is not an error, but a limitation, returning false is sufficient
-    // indicating that no hash has been persisted, but there was also no real
-    // error to deal with
+bool HashLog::Load(const std::string &path, State *state, std::string* err) {
+  METRIC_RECORD(".ninja_hashes load");
+  char buf[kMaxPathSize + 1];
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    if (errno == ENOENT)
+      return true;
+    err->assign(strerror(errno));
     return false;
   }
 
-  const key_t key(variant, path);
-  // check whether we really need to push this entry (already there?)
-  map_t::iterator it = hash_map_.lower_bound(key);
-  if (it == hash_map_.end() || it->first         != key
-                            || it->second.hash_  != hash
-                            || it->second.mtime_ != mtime) {
-
-    // persist the file path (null terminated)
-    if (fputs(path.c_str(), file_) == EOF) {
-      *err = strerror(errno);
-      return false;
-    }
-    if (fputc('\0', file_) == EOF) {
-      *err = strerror(errno);
-      return false;
-    }
-
-    // persist the file hash
-    if (fwrite(&hash, sizeof(hash), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-
-    // persist the modification time of the hashed file
-    if (fwrite(&mtime, sizeof(mtime), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-
-    // persist the variant
-    if (fwrite(&variant, sizeof(variant), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-
-    fflush(file_);
-
-    // determine whether we just update the map or insert a new entry
-    if (it != hash_map_.end() && it->first == key) {
-      it->second.hash_  = hash;
-      it->second.mtime_ = mtime;
-    } else {
-      hash_map_.insert(it, map_t::value_type(key, mapped_t(hash, mtime)));
-    }
-    ++total_values_;
+  bool valid_header = true;
+  int version = 0;
+  if (!fgets(buf, sizeof(buf), f) || fread(&version, 4, 1, f) < 1)
+    valid_header = false;
+  if (!valid_header || strcmp(buf, kFileSignature) != 0 ||
+      version != kCurrentVersion) {
+    if (version == 1)
+      *err = "hash log version change; rebuilding";
+    else
+      *err = "bad hash log signature or version; starting over";
+    fclose(f);
+    unlink(path.c_str());
+    // Don't report this as a failure.  An empty deps log will cause
+    // us to rebuild the outputs anyway.
+    return true;
   }
+
+  long offset;
+  bool read_failed = false;
+  size_t total_entry_count = 0;
+
+  // While reading we need a mapping from id to back to Node.
+  map<int, Node*> ids;
+
+  LogEntry *entry = new LogEntry;
+
+  for (;;) {
+    offset = ftell(f);
+
+    // Read the entry.
+    if (fread(entry, sizeof(*entry), 1, f) < 1) {
+      if (!feof(f))
+        read_failed = true;
+      break;
+    }
+
+    bool has_path = (entry->id_ & 0x8000000) != 0;
+
+    entry->id_ &= 0x7FFFFFFF;
+
+    if (has_path) {
+      // Read the path.
+      unsigned path_size;
+
+      if (fread(&path_size, sizeof(path_size), 1, f) < 1) {
+        read_failed = true;
+        break;
+      }
+
+      if (path_size > kMaxPathSize) {
+        read_failed = true;
+        errno = ERANGE;
+        break;
+      }
+
+      if (fread(buf, path_size, 1, f) < 1) {
+        read_failed = true;
+        break;
+      }
+
+      // Strip padding.
+      while (path_size > 0 && buf[path_size - 1] == '\0')
+        --path_size;
+
+      StringPiece path(buf, path_size);
+      Node* node = state->GetNode(path, 0);
+      ids[entry->id_] = node;
+    }
+
+    map<int, Node*>::iterator it = ids.find(entry->id_);
+
+    if (it == ids.end()) {
+      read_failed = true;
+      errno = ERANGE;
+      break;
+    }
+
+    ++total_entry_count;
+    pair<Entries::iterator, bool> insert_result = entries_.insert(
+        Entries::value_type(it->second->path(), NULL));
+
+    if (insert_result.second) {
+      // new entry
+      insert_result.first->second = entry;
+      entry = new LogEntry;
+    } else {
+      // overwrite existing entry
+      *insert_result.first->second = *entry;
+    }
+  }
+
+  delete entry;
+
+  if (read_failed) {
+    // An error occurred while loading; try to recover by truncating the
+    // file to the last fully-read record.
+    if (ferror(f)) {
+      *err = strerror(ferror(f));
+    } else {
+      *err = "premature end of file";
+    }
+    fclose(f);
+
+    if (!Truncate(path, offset, err))
+      return false;
+
+    // The truncate succeeded; we'll just report the load error as a
+    // warning because the build can proceed.
+    *err += "; recovering";
+    return true;
+  }
+
+  fclose(f);
+
+  // Rebuild the log if there are too many dead records.
+  size_t kMinCompactionEntryCount = 1000;
+  size_t kCompactionRatio = 3;
+  if (total_entry_count > kMinCompactionEntryCount &&
+      total_entry_count > entries_.size() * kCompactionRatio) {
+    needs_recompaction_ = true;
+  }
+
+  // for (Entries::iterator it = entries_.begin(); it != entries_.end(); ++it)
+  //   std::cout << it->first.AsString() << std::endl;
+
   return true;
 }
 
-bool HashLog::UpdateHash(Node* node, const hash_variant variant,
-                         string* err, const bool force, hash_t* result) {
-  // initialize the result
-  if (result) { *result = 0; }
-
-  if (file_ == NULL) {
-    if (!Load(err)) {
-      return false;
-    }
-  }
-
-  // early exit for files with too long file name
-  // if we would go ahead and let ninja stat the file, it will fail
-  if (node->path().length() > kMaxFileNameLength) {
-    return false;
-  }
-
-  if (!node->StatIfNecessary(disk_interface_, err)) {
-    return false;
-  }
-
-  // early exit for non-existing files
-  if (!node->exists()) {
-    return false;
-  }
-
-  // check whether we need to update the hash
-
-  // first, do we have an old hash? and has the modification time changed
-  // since we recorded the old hash?
-  const key_t key(variant, node->path());
-  const map_t::const_iterator it = hash_map_.find(key);
-  const bool mtime_changed =
-          (it == hash_map_.end() || it->second.mtime_ != node->mtime());
-
-  // we know the old hash
-  if (result && it != hash_map_.end()) {
-    *result = it->second.hash_;
-  }
-
-  const string& path = node->path();
-
-  // based on the decision, create the hash and persist it
-  if (force || mtime_changed) {
-    const hash_t hash = disk_interface_->HashFile(path, err);
-    if (!err->empty()) {
-      return false;
-    }
-    if (PutHash(path, hash, node->mtime(), variant, err)) {
-      if (result) { *result = hash; }
-      return true;
-    }
-  }
-  return false;
-}
-
-HashLog::hash_t HashLog::GetHash(Node* node, const hash_variant variant,
-                                 string* err) {
-  if (file_ == NULL) {
-    if (!Load(err)) {
-      return 0;
-    }
-  }
-  const string& path = node->path();
-  const map_t::const_iterator it = hash_map_.find(key_t(variant, path));
-  if (it == hash_map_.end()) {
-    return 0;
-  } else {
-    return it->second.hash_;
-  }
-}
-
-bool HashLog::HashChanged(Node* node, const hash_variant variant, string* err) {
-  if (file_ == NULL) {
-    if (!Load(err)) {
-      return true;
-    }
-  }
-
-  // this is an early exit with cached results of this method
-  std::map<Node*,bool>::const_iterator i = changed_files_.find(node);
-  if (i != changed_files_.end()) {
-    return i->second;
-  }
-
-  if (!node->StatIfNecessary(disk_interface_, err)) {
-    return false;
-  }
-
-  const string& path = node->path();
-  const map_t::const_iterator it = hash_map_.find(key_t(variant, path));
-
-  bool result = false;
-
-  // no hash in our hash log means we consider the hash changed
-  if (it == hash_map_.end()) {
-    changed_files_[node] = true;
-    result = true;
-  }
-
-  // we only check the hash if the mtime of the file changed
-  // since we last computed the hash
-  if (!result && it->second.mtime_ != node->mtime()) {
-    hash_t current_hash = disk_interface_->HashFile(path, err);
-    if (!err->empty()) {
-      return true;
-    }
-    result = it->second.hash_ != current_hash;
-    PutHash(path, current_hash, node->mtime(), variant, err);
-    if (!err->empty()) {
-      return true;
-    }
-  }
-  changed_files_[node] = result;
-  return result;
-}
-
-bool HashLog::EdgeChanged(const Edge* edge, std::string* err) {
-  // if the edge has no (non order only) deps or no outputs,
-  // we cannot decide and exit early
-  if (edge->inputs_.size() - edge->order_only_deps_ == 0
-   || edge->outputs_.size() == 0) {
-     return true;
-  }
-
-  hash_t target = 0;
-  // we check first if any of the inputs have changed since we
-  // ran last time. if so, we can exit early at this point already.
-  for (vector<Node*>::const_iterator i = edge->inputs_.begin();
-     i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
-    if (HashChanged(*i, SOURCE, err)) {
-      return true;
-    }
-    target += GetHash(*i, SOURCE, err);
-    if (!err->empty()) {
-      return true; // in case of any errors we exit early and delegate the
-                   // error handling (true === edge changed)
-    }
-  }
-
-  // we also check the combined hash for the edge's outputs.
-  // (even though all the inputs are unchanged, we still might have the case
-  // that our Edge has not been built in the last run, hence updated files did
-  // not influence any output of our build and therefore are subject to rebuild)
-  for (vector<Node*>::const_iterator i = edge->outputs_.begin();
-       i != edge->outputs_.end(); ++i) {
-    key_t key(TARGET, (*i)->path());
-    map_t::const_iterator it = hash_map_.find(key);
-    if (!(*i)->StatIfNecessary(disk_interface_, err)) {
-      return false;
-    }
-    if (it == hash_map_.end()
-     || it->second.hash_ != target
-     || it->second.mtime_ != (*i)->mtime()) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-void HashLog::EdgeFinished(const Edge *edge, std::string* err) {
-  hash_t temp_hash = 0;
-  hash_t target = 0;
-  for (vector<Node*>::const_iterator i = edge->inputs_.begin();
-       i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
-    UpdateHash(*i, SOURCE, err, false, &temp_hash);
-    if (!err->empty()) {
-      *err = "Error updating hash log: " + *err;
-      return;
-    }
-    target += temp_hash;
-  }
-  for (vector<Node*>::const_iterator i = edge->outputs_.begin();
-       i != edge->outputs_.end(); ++i) {
-    TimeStamp mtime = disk_interface_->Stat((*i)->path(), err);
-    if (mtime < 0)
-      return;
-    PutHash((*i)->path(), target, mtime, TARGET, err);
-    if (!err->empty()) {
-      *err = "Error updating hash log: " + *err;
-      return;
-    }
-  }
-}
-
-bool HashLog::Recompact(string* err, const bool force) {
-  // this roughly means the hashlog has 3 times the size of its actual needed
-  // size
-  if (force || total_values_ > 3 * hash_map_.size()) {
-    METRIC_RECORD(string(kHashLogFileName) + " recompact");
-    if (file_ == NULL) {
-      if (!Load(err)) {
-        return false;
-      }
-    }
-
-    // we just throw away the old log and put all entries we have in again
-    // fairly simple :-)
-
-    const map_t old_hash_map = hash_map_;
-
-    Close();
-    unlink(filename_.c_str());
-    Load(err);
-    if (!err->empty()) {
-      return false;
-    }
-
-    for (map_t::const_iterator I = old_hash_map.begin(),
-                                                  E = old_hash_map.end();
-                                                  I != E; ++I) {
-      PutHash(I->first.val_, I->second.hash_, I->second.mtime_,
-              I->first.variant_, err);
-      if (!err->empty()) {
-        return false;
-      }
-    }
-    return true;
-  }
-  return false;
-}
-
-bool HashLog::Close() {
-  if (file_) {
-    fclose(file_);
-    file_ = NULL;
-    return true;
-  }
-  return false;
-}
-
-bool HashLog::Load(string* err) {
-  // reset all the affected members
-  assert(file_ == NULL);
-  hash_map_.clear();
-  changed_files_.clear();
-  total_values_ = 0;
-
-  METRIC_RECORD(string(kHashLogFileName) + " load");
-
-  // open up the file
-  char buf[sizeof(kFileSignature)];
-  file_ = fopen(filename_.c_str(), "a+b");
+bool HashLog::OpenForWrite(const std::string &path, std::string* err) {
+  file_ = fopen(path.c_str(), "ab");
   if (!file_) {
     *err = strerror(errno);
     return false;
   }
+  // Set the buffer size to this and flush the file buffer after every record
+  // to make sure records aren't written partially.
+  setvbuf(file_, NULL, _IOFBF, kMaxPathSize + 1);
+  SetCloseOnExec(fileno(file_));
 
-  // file header actions for new files
-
-  // jump to the end of the file
+  // Opening a file in append mode doesn't set the file pointer to the file's
+  // end on Windows. Do that explicitly.
   fseek(file_, 0, SEEK_END);
 
-  // there was no file or the file was empty. we create the header
   if (ftell(file_) == 0) {
-    // the header string
+    // XXX: pad this to the LogEntry size
     if (fwrite(kFileSignature, sizeof(kFileSignature) - 1, 1, file_) < 1) {
       *err = strerror(errno);
       return false;
     }
-    // the version int
-    if (fwrite(&kCurrentVersion, sizeof(kCurrentVersion), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-    // the hash size used
-    if (fwrite(&kHash_TSize, sizeof(kHash_TSize), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-    // the timestamp size used
-    if (fwrite(&kTimestampSize, sizeof(kTimestampSize), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-    // the maximum filename length used
-    if (fwrite(&kMaxFileNameLength, sizeof(kMaxFileNameLength), 1, file_) < 1) {
-      *err = strerror(errno);
-      return false;
-    }
-    // flush it to the file
-    if (fflush(file_) != 0) {
+    if (fwrite(&kCurrentVersion, 4, 1, file_) < 1) {
       *err = strerror(errno);
       return false;
     }
   }
-
-  // file header actions for all files (new/existing)
-
-  // jump to the beginning of the file
-  fseek(file_, 0, SEEK_SET);
-
-  // load header
-  bool valid_header = true;
-  uint32_t version = 0;
-  uint32_t hash_t_size = 0;
-  uint32_t timestamp_size = 0;
-  uint32_t maxfilename_size = 0;
-
-  // validate the header
-  if (!fgets(buf, sizeof(buf), file_)
-         || fread(&version,          sizeof(version),          1, file_) < 1
-         || fread(&hash_t_size,      sizeof(hash_t_size),      1, file_) < 1
-         || fread(&timestamp_size,   sizeof(timestamp_size),   1, file_) < 1
-         || fread(&maxfilename_size, sizeof(maxfilename_size), 1, file_) < 1 ) {
-    valid_header = false;
+  if (fflush(file_) != 0) {
+    *err = strerror(errno);
+    return false;
   }
-  if (!valid_header || strcmp(buf, kFileSignature) != 0
-                    || version != kCurrentVersion
-                    || hash_t_size != kHash_TSize
-                    || timestamp_size != kTimestampSize
-                    || maxfilename_size != kMaxFileNameLength) {
-    *err = "incompatible hash log, resetting";
-    Close();
-    unlink(filename_.c_str());
-    return Load(err);
+  return true;
+}
+
+bool HashLog::Recompact(const std::string &path, std::string* err) {
+  *err = "not implemented";
+  return false;
+}
+
+bool HashLog::OutputHashClean(Node *output, Edge* edge, std::string* err) {
+  METRIC_RECORD("checking hashes");
+  Hash output_hash = 0;
+
+  // Check if any inputs are updated.  Combine their hashes into the hash for
+  // the output.
+  for (vector<Node*>::const_iterator i = edge->inputs_.begin();
+      i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
+    if (!HashIsClean(*i, true, &output_hash, err))
+      return false;
   }
 
-  // read path/hash/mtime/variant tuple stream
+  return HashIsClean(output, false, &output_hash, err);
+}
 
-  char path_raw[kMaxFileNameLength];
-  for (;;) {
-    // read the null terminated path
-    char* str = path_raw;
-    int c;
-    size_t count = 0;
-    do {
-      c = fgetc(file_);
-      if (c == EOF) {
-          break;
-      } else {
-        *str = (char) c;
-        ++count;
+bool HashLog::RecordHashes(Edge* edge, DiskInterface *disk_interface, std::string* err) {
+  METRIC_RECORD("recording hashes");
+  Hash output_hash = 0;
+
+  // Record hashes for inputs.  Combine their hashes into the hash for the
+  // outputs.
+  for (vector<Node*>::const_iterator i = edge->inputs_.begin();
+      i != edge->inputs_.end() - edge->order_only_deps_; ++i) {
+    if (!(*i)->Stat(disk_interface, err)) {
+      *err = "error restatting in hash log: " + *err;
+      return false;
+    }
+
+    if (!RecordHash(*i, true, &output_hash, err))
+      return false;
+  }
+
+  // Record hashes for outputs.  Combine their hashes into a seed for the
+  // outputs.
+  for (vector<Node*>::const_iterator i = edge->outputs_.begin();
+      i != edge->outputs_.end(); ++i) {
+    if (!(*i)->Stat(disk_interface, err)) {
+      *err = "error restatting in hash log: " + *err;
+      return false;
+    }
+
+    if (!RecordHash(*i, false, &output_hash, err))
+      return false;
+  }
+
+  return true;
+}
+
+/// Check if the node's hash matches the one recorded before.  If the node is
+/// an input combine its actual hash it into the accumulator otherwise record the
+/// accumulated hash of the inputs.  If the file is opened for writing and
+/// the node changed record the new hash.
+bool HashLog::HashIsClean(Node* node, bool is_input, Hash *acc, string *err) {
+  // Stat should have happened before.
+  if (!node->exists() || !node->status_known())
+    return false;
+
+  Entries::iterator it = entries_.find(node->path());
+
+  // We do not know about this node yet.
+  if (it == entries_.end())
+    return false;
+
+  Hash old_hash = is_input ? it->second->input_hash_ : it->second->output_hash_;
+
+  if (it->second->mtime_ != node->mtime()) {
+    if (is_input) {
+      // Node is an input and it's mtime is newer.  Recompute and record hash.
+
+      if (hasher_->HashFile(node->path(), &it->second->input_hash_, err) != DiskInterface::Okay) {
+        *err = "error hashing file: " + *err;
+        return false; 
       }
-    } while((*str++ != '\0') && (count < kMaxFileNameLength));
-    bool key_read = (c != EOF && count < kMaxFileNameLength);
-    std::string path(path_raw);
-
-    // read the hash
-    hash_t hash = 0;
-    const size_t val_read = fread(&hash, sizeof(hash_t), 1, file_);
-
-    // read the mtime
-    TimeStamp mtime = 0;
-    const size_t mtime_read = fread(&mtime, sizeof(TimeStamp), 1, file_);
-
-    // read the variant
-    hash_variant variant = UNDEFINED;
-    const size_t variant_read = fread(&variant, sizeof(hash_variant), 1, file_);
-
-    // consistency check
-    // either we read a value for every element or we read nothing at all
-    // in case this is inconsistent, we consider the log to be corrupt
-    if (!key_read || val_read != 1 || mtime_read != 1 || variant_read != 1) {
-      if (!key_read            && count   == 0
-          && val_read     == 0 && hash    == 0
-          && mtime_read   == 0 && mtime   == 0
-          && variant_read == 0 && variant == UNDEFINED
-          && feof(file_)) {
-        // all fine -- all values are untouched and we see eof
-        break;
-      } else {
-        // the log is not consistent / corrupt
-        *err = "the log was corrupted, resetting";
-        Close();
-        unlink(filename_.c_str());
-        return Load(err);
-      }
-    } else { // all fine, ready to store it internally
-      const key_t key(variant, path);
-      map_t::iterator it = hash_map_.lower_bound(key);
-      if (it != hash_map_.end() && it->first == key) {
-        it->second.hash_  = hash;
-        it->second.mtime_ = mtime;
-      } else {
-        hash_map_.insert(it, map_t::value_type(key, mapped_t(hash, mtime)));
-      }
-      ++total_values_;
+    } else {
+      // Node is an output and it's mtime is newer.  Record the combined hash
+      // of its inputs.
+      it->second->output_hash_ = *acc;
     }
+
+    it->second->mtime_ = node->mtime();
+
+    // Log is opened for writing, go ahead and record the hash since we have it
+    // already.
+    if (file_ != NULL && !WriteEntry(node, it->second, err))
+      return false;
   }
 
-  Recompact(err);
+  Hash new_hash;
 
-  SetCloseOnExec(fileno(file_));
+  if (is_input) {
+    new_hash = it->second->input_hash_;
+    *acc ^= it->second->input_hash_;
+  } else {
+    new_hash = it->second->output_hash_;
+  }
 
-  if (!err->empty()) {
+  return old_hash == new_hash;
+}
+
+/// Record the node's hash.  If the node is an input combine its actual hash
+/// it into the accumulator otherwise record the accumulated hash of the
+/// inputs.
+bool HashLog::RecordHash(Node *node, bool is_input, Hash *acc, string *err) {
+  Entries::iterator it = entries_.find(node->path());
+  LogEntry* entry;
+
+  if (it != entries_.end())
+    entry = it->second;
+  else
+    entry = new LogEntry;
+
+  if (entry->mtime_ != node->mtime()) {
+    entry->mtime_ = node->mtime();
+
+    if (is_input) {
+      if (hasher_->HashFile(node->path(), &entry->input_hash_, err) != DiskInterface::Okay) {
+        *err = "hashing file: " + *err;
+        return false; 
+      }
+    } else {
+      entry->output_hash_ = *acc;
+    }
+
+    if (!WriteEntry(node, entry, err))
+      return false;
+  }
+
+  if (it == entries_.end())
+    entries_.insert(Entries::value_type(node->path(), entry));
+
+  if (is_input)
+    *acc ^= entry->input_hash_;
+
+  return true;
+}
+
+static const char padding_data[sizeof(HashLog::LogEntry)] = {0};
+
+bool HashLog::WriteEntry(Node *node, LogEntry *entry, string *err) {
+  if (entry->id_ == 0)
+    // We haven't seen this node before, record its path and give it an id and
+    // mark it as having the path appended.
+    entry->id_ = next_id_++ | 0x8000000;
+
+  if (fwrite(entry, 1, sizeof(*entry), file_) < 1) {
+      err->assign(strerror(errno));
+      return false;
+  }
+
+  if (entry->id_ & 0x8000000) {
+    const size_t entry_size = sizeof(LogEntry);
+    unsigned path_size = node->path().size();
+
+    // Pad path record to size of LogEntry.
+    size_t padding_size = (entry_size - (sizeof(path_size) + path_size) % entry_size) % entry_size;
+    unsigned record_size = path_size + padding_size;
+
+    if (fwrite(&record_size, sizeof(record_size), 1, file_) < 1) {
+      err->assign(strerror(errno));
+      return false;
+    }
+
+    if (fwrite(node->path().data(), path_size, 1, file_) < 1) {
+      err->assign(strerror(errno));
+      return false;
+    }
+
+    if (padding_size > 0 && fwrite(padding_data, padding_size, 1, file_) < 1) {
+      err->assign(strerror(errno));
+      return false;
+    }
+
+    entry->id_ &= 0x7FFFFFFF;
+  }
+
+  if (fflush(file_) != 0) {
+    err->assign(strerror(errno));
     return false;
   }
 

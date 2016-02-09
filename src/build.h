@@ -33,6 +33,7 @@ struct BuildLog;
 struct BuildStatus;
 struct DiskInterface;
 struct Edge;
+struct HashLog;
 struct Node;
 struct State;
 
@@ -140,7 +141,7 @@ struct BuildConfig {
 struct Builder {
   Builder(State* state, const BuildConfig& config,
           BuildLog* build_log, DepsLog* deps_log,
-          DiskInterface* disk_interface);
+          HashLog* hash_log, DiskInterface* disk_interface);
   ~Builder();
 
   /// Clean up after interrupted commands by deleting output files.
