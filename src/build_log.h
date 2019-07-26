@@ -24,13 +24,7 @@ using namespace std;
 #include "util.h"  // uint64_t
 
 struct Edge;
-
-/// Can answer questions about the manifest for the BuildLog.
-struct BuildLogUser {
-  /// Return if a given output is no longer part of the build manifest.
-  /// This is only called during recompaction and doesn't have to be fast.
-  virtual bool IsPathDead(StringPiece s) const = 0;
-};
+struct BuildLogUser;
 
 /// Store a log of every command ran for every build.
 /// It has a few uses:

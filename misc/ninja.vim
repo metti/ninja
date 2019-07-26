@@ -44,7 +44,7 @@ syn match ninjaKeyword "^subninja\>"
 syn region ninjaRule start="^rule" end="^\ze\S" contains=TOP transparent
 syn keyword ninjaRuleCommand contained containedin=ninjaRule command
                                      \ deps depfile description generator
-                                     \ pool restat rspfile rspfile_content
+                                     \ pool restat rspfile rspfile_content hash_input
 
 syn region ninjaPool start="^pool" end="^\ze\S" contains=TOP transparent
 syn keyword ninjaPoolCommand contained containedin=ninjaPool  depth

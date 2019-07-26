@@ -21,6 +21,7 @@ using namespace std;
 
 #include "dyndep.h"
 #include "eval_env.h"
+#include "hash_log.h"
 #include "timestamp.h"
 #include "util.h"
 
@@ -267,9 +268,10 @@ struct ImplicitDepLoader {
 /// and updating the dirty/outputs_ready state of all the nodes and edges.
 struct DependencyScan {
   DependencyScan(State* state, BuildLog* build_log, DepsLog* deps_log,
-                 DiskInterface* disk_interface,
+                 HashLog* hash_log, DiskInterface* disk_interface,
                  DepfileParserOptions const* depfile_parser_options)
       : build_log_(build_log),
+        hash_log_(hash_log),
         disk_interface_(disk_interface),
         dep_loader_(state, deps_log, disk_interface, depfile_parser_options),
         dyndep_loader_(state, disk_interface) {}
@@ -297,6 +299,10 @@ struct DependencyScan {
     return dep_loader_.deps_log();
   }
 
+  HashLog* hash_log() {
+    return hash_log_;
+  }
+
   /// Load a dyndep file from the given node's path and update the
   /// build graph with the new information.  One overload accepts
   /// a caller-owned 'DyndepFile' object in which to store the
@@ -314,6 +320,7 @@ struct DependencyScan {
                             const string& command, Node* output);
 
   BuildLog* build_log_;
+  HashLog *hash_log_;
   DiskInterface* disk_interface_;
   ImplicitDepLoader dep_loader_;
   DyndepLoader dyndep_loader_;

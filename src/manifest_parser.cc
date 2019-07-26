@@ -149,6 +149,12 @@ bool ManifestParser::ParseRule(string* err) {
 
     if (Rule::IsReservedBinding(key)) {
       rule->AddBinding(key, value);
+
+      // Set flag so the builder can skip opening the hash log if it isn't
+      // needed.
+      if (!state_->need_hash_log_ && key == "hash_input" && !value.empty()) {
+        state_->need_hash_log_ = true;
+      }
     } else {
       // Die on other keyvals for now; revisit if we want to add a
       // scope here.

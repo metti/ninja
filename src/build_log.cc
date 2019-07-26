@@ -34,6 +34,7 @@
 #include "build.h"
 #include "graph.h"
 #include "metrics.h"
+#include "log_user.h"
 #include "util.h"
 #if defined(_MSC_VER) && (_MSC_VER < 1800)
 #define strtoll _strtoi64

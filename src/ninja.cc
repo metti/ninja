@@ -34,6 +34,7 @@
 #include "build.h"
 #include "build_log.h"
 #include "deps_log.h"
+#include "hash_log.h"
 #include "clean.h"
 #include "debug_flags.h"
 #include "disk_interface.h"
@@ -42,6 +43,7 @@
 #include "manifest_parser.h"
 #include "metrics.h"
 #include "state.h"
+#include "log_user.h"
 #include "util.h"
 #include "version.h"
 
@@ -83,7 +85,8 @@ struct Options {
 /// to poke into these, so store them as fields on an object.
 struct NinjaMain : public BuildLogUser {
   NinjaMain(const char* ninja_command, const BuildConfig& config) :
-      ninja_command_(ninja_command), config_(config) {}
+      ninja_command_(ninja_command), config_(config), disk_interface_(),
+      hash_log_(&disk_interface_) {}
 
   /// Command line used to run Ninja.
   const char* ninja_command_;
@@ -102,6 +105,7 @@ struct NinjaMain : public BuildLogUser {
 
   BuildLog build_log_;
   DepsLog deps_log_;
+  HashLog hash_log_;
 
   /// The type of functions that are the entry points to tools (subcommands).
   typedef int (NinjaMain::*ToolFunc)(const Options*, int, char**);
@@ -135,6 +139,10 @@ struct NinjaMain : public BuildLogUser {
   /// Open the deps log: load it, then open for writing.
   /// @return false on error.
   bool OpenDepsLog(bool recompact_only = false);
+
+  /// Open the hash log: load it, then open for writing.
+  /// @return false on error.
+  bool OpenHashLog(bool recompact_only = false);
 
   /// Ensure the build directory exists, creating it if necessary.
   /// @return false on error.
@@ -248,7 +256,9 @@ bool NinjaMain::RebuildManifest(const char* input_file, string* err) {
   if (!node)
     return false;
 
-  Builder builder(&state_, config_, &build_log_, &deps_log_, &disk_interface_);
+  Builder builder(&state_, config_, &build_log_, &deps_log_,
+                  state_.need_hash_log_ ? &hash_log_ : NULL,
+                  &disk_interface_);
   if (!builder.AddTarget(node, err))
     return false;
 
@@ -836,6 +846,9 @@ int NinjaMain::ToolRecompact(const Options* options, int argc, char* argv[]) {
       !OpenDepsLog(/*recompact_only=*/true))
     return 1;
 
+  if (state_.need_hash_log_ && !OpenHashLog(/*recompact_only=*/true))
+      return 1;
+
   return 0;
 }
 
@@ -1079,6 +1092,43 @@ bool NinjaMain::OpenDepsLog(bool recompact_only) {
   return true;
 }
 
+bool NinjaMain::OpenHashLog(bool recompact_only) {
+  string path = ".ninja_hashes";
+  if (!build_dir_.empty())
+    path = build_dir_ + "/" + path;
+
+  string err;
+  if (!hash_log_.Load(path, &state_, &err)) {
+    Error("loading hash log %s: %s", path.c_str(), err.c_str());
+    return false;
+  }
+  if (!err.empty()) {
+    // Hack: Load() can return a warning via err by returning true.
+    Warning("%s", err.c_str());
+    err.clear();
+  }
+
+  if (recompact_only) {
+    ImplicitDepLoader dep_loader(&state_, &deps_log_,
+                                 &disk_interface_,
+                                 &config_.depfile_parser_options);
+
+    bool success = hash_log_.Recompact(path, *this, dep_loader, &err);
+    if (!success)
+      Error("failed recompaction: %s", err.c_str());
+    return success;
+  }
+
+  if (!config_.dry_run) {
+    if (!hash_log_.OpenForWrite(path, *this, &err)) {
+      Error("opening hash log: %s", err.c_str());
+      return false;
+    }
+  }
+
+  return true;
+}
+
 void NinjaMain::DumpMetrics() {
   g_metrics->Report();
 
@@ -1111,7 +1161,9 @@ int NinjaMain::RunBuild(int argc, char** argv) {
 
   disk_interface_.AllowStatCache(g_experimental_statcache);
 
-  Builder builder(&state_, config_, &build_log_, &deps_log_, &disk_interface_);
+  Builder builder(&state_, config_, &build_log_, &deps_log_,
+                  state_.need_hash_log_ ? &hash_log_ : NULL,
+                  &disk_interface_);
   for (size_t i = 0; i < targets.size(); ++i) {
     if (!builder.AddTarget(targets[i], &err)) {
       if (!err.empty()) {
@@ -1138,6 +1190,17 @@ int NinjaMain::RunBuild(int argc, char** argv) {
       return 2;
     }
     return 1;
+  }
+
+  // Recompacting needs to be done after we have loaded the implicit dependencies
+  // otherwise those will get removed from the log
+  if (state_.need_hash_log_)
+  {
+    ImplicitDepLoader dep_loader(&state_, &deps_log_,
+                                 &disk_interface_,
+                                 &config_.depfile_parser_options);
+    if (!hash_log_.RecompactIfNeeded(dep_loader, &err))
+      Error("%s", err.c_str()); // continue building anyway
   }
 
   return 0;
@@ -1322,6 +1385,9 @@ NORETURN void real_main(int argc, char** argv) {
       exit(1);
 
     if (!ninja.OpenBuildLog() || !ninja.OpenDepsLog())
+      exit(1);
+
+    if (ninja.state_.need_hash_log_ && !ninja.OpenHashLog())
       exit(1);
 
     if (options.tool && options.tool->when == Tool::RUN_AFTER_LOGS)

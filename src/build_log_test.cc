@@ -14,6 +14,7 @@
 
 #include "build_log.h"
 
+#include "log_user.h"
 #include "util.h"
 #include "test.h"
 

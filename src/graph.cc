@@ -245,6 +245,8 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
     return true;
   }
 
+  bool hashes_are_clean = false;
+
   // Dirty if the output is older than the input.
   if (most_recent_input && output->mtime() < most_recent_input->mtime()) {
     TimeStamp output_mtime = output->mtime();
@@ -261,12 +263,31 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
     }
 
     if (output_mtime < most_recent_input->mtime()) {
-      EXPLAIN("%soutput %s older than most recent input %s "
-              "(%" PRId64 " vs %" PRId64 ")",
-              used_restat ? "restat of " : "", output->path().c_str(),
-              most_recent_input->path().c_str(),
-              output_mtime, most_recent_input->mtime());
-      return true;
+      if (hash_log() && edge->GetBindingBool("hash_input")) {
+        string err;
+        string reason;
+        hashes_are_clean = hash_log()->HashesAreClean(output, edge, &reason, &err);
+        if (!hashes_are_clean) {
+          const char *msg = reason.c_str();
+          if (!err.empty()) {
+            msg = "rehashing of inputs failed";
+            Error(err.c_str());     // would be disabled, but we log the error
+          }
+          EXPLAIN("%soutput %s older than most recent input %s "
+                  "(%" PRId64 " vs " "%" PRId64 ") %s",
+                  used_restat ? "restat of " : "", output->path().c_str(),
+                  most_recent_input->path().c_str(),
+                  output_mtime, most_recent_input->mtime(), msg);
+          return true;
+        }
+      } else {
+        EXPLAIN("%soutput %s older than most recent input %s "
+                "(%" PRId64 " vs %" PRId64 ")",
+                used_restat ? "restat of " : "", output->path().c_str(),
+                most_recent_input->path().c_str(),
+                output_mtime, most_recent_input->mtime());
+        return true;
+      }
     }
   }
 
@@ -286,10 +307,32 @@ bool DependencyScan::RecomputeOutputDirty(Edge* edge,
         // mtime of the most recent input.  This can occur even when the mtime
         // on disk is newer if a previous run wrote to the output file but
         // exited with an error or was interrupted.
-        EXPLAIN("recorded mtime of %s older than most recent input %s (%" PRId64 " vs %" PRId64 ")",
-                output->path().c_str(), most_recent_input->path().c_str(),
-                entry->mtime, most_recent_input->mtime());
-        return true;
+        if (!hashes_are_clean) {
+          if (hash_log() && edge->GetBindingBool("hash_input")) {
+            string err;
+            string reason;
+            hashes_are_clean = hash_log()->HashesAreClean(output, edge, &reason, &err);
+            if (!hashes_are_clean) {
+              const char *msg = reason.c_str();
+              if (!err.empty()) {
+                msg = "rehashing of inputs failed";
+                Error(err.c_str());     // would be disabled, but we log the error
+              }
+              EXPLAIN("%soutput %s older than most recent input %s "
+                      "(%" PRId64 " vs " "%" PRId64 ") %s",
+                      edge->GetBindingBool("restat") ? "restat of " : "", output->path().c_str(),
+                      most_recent_input->path().c_str(),
+                      entry->mtime, most_recent_input->mtime(), msg);
+              return true;
+            }
+          } else {
+            EXPLAIN("recorded mtime of %s older than most recent input %s (%" PRId64 " vs %" PRId64 ")",
+                    output->path().c_str(), most_recent_input->path().c_str(),
+                    entry->mtime, most_recent_input->mtime());
+            return true;
+          }
+
+        } 
       }
     }
     if (!entry && !generator) {
