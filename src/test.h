@@ -149,6 +149,7 @@ struct VirtualFileSystem : public DiskInterface {
   virtual bool MakeDir(const string& path);
   virtual Status ReadFile(const string& path, string* contents, string* err);
   virtual int RemoveFile(const string& path);
+  virtual Status HashFile(const string& path, Hash* contents, string* err);
 
   /// An entry for a single in-memory file.
   struct Entry {

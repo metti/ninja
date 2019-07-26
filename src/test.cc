@@ -32,6 +32,7 @@
 #include "graph.h"
 #include "manifest_parser.h"
 #include "util.h"
+#include "PMurHash.h"
 
 namespace {
 
@@ -191,6 +192,21 @@ int VirtualFileSystem::RemoveFile(const string& path) {
   } else {
     return 1;
   }
+}
+
+FileReader::Status VirtualFileSystem::HashFile(const string& path,
+                                               Hash* hash,
+                                               string* err) {
+  files_read_.push_back(path);
+  FileMap::iterator i = files_.find(path);
+  if (i != files_.end()) {
+    *hash = PMurHash32(0,
+                       i->second.contents.data(),
+                       i->second.contents.size());
+    return Okay;
+  }
+  *err = strerror(ENOENT);
+  return NotFound;
 }
 
 void ScopedTempDir::CreateAndEnter(const string& name) {

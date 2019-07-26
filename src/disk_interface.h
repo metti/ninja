@@ -39,11 +39,22 @@ struct FileReader {
                           string* err) = 0;
 };
 
+/// Interface for hashing files from disk.
+struct FileHasher {
+  typedef unsigned Hash;
+
+  /// Read file and store hash.  On success, return Okay.
+  /// On error, return another Status and fill |err|.
+  virtual FileReader::Status HashFile(const string& path, Hash *hash,
+                                      string* err) = 0;
+  virtual ~FileHasher() {}
+};
+
 /// Interface for accessing the disk.
 ///
 /// Abstract so it can be mocked out for tests.  The real implementation
 /// is RealDiskInterface.
-struct DiskInterface: public FileReader {
+struct DiskInterface: public FileReader, public FileHasher {
   /// stat() a file, returning the mtime, or 0 if missing and -1 on
   /// other errors.
   virtual TimeStamp Stat(const string& path, string* err) const = 0;
@@ -79,6 +90,7 @@ struct RealDiskInterface : public DiskInterface {
   virtual bool MakeDir(const string& path);
   virtual bool WriteFile(const string& path, const string& contents);
   virtual Status ReadFile(const string& path, string* contents, string* err);
+  virtual Status HashFile(const string& path, Hash *hash, string* err);
   virtual int RemoveFile(const string& path);
 
   /// Whether stat information can be cached.  Only has an effect on Windows.

@@ -31,6 +31,8 @@
 #include "metrics.h"
 #include "util.h"
 
+#include "PMurHash.h"
+
 namespace {
 
 string DirName(const string& path) {
@@ -264,6 +266,37 @@ FileReader::Status RealDiskInterface::ReadFile(const string& path,
   case -ENOENT: return NotFound;
   default:      return OtherError;
   }
+}
+
+FileReader::Status RealDiskInterface::HashFile(const string& path,
+                                               Hash* hash,
+                                               string* err) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    err->assign(strerror(errno));
+    if (errno == ENOENT)
+      return NotFound;
+    else
+      return OtherError;
+  }
+
+  char buf[64 << 10];
+  MH_UINT32 h1 = 0;
+  MH_UINT32 carry = 0;
+  size_t total_len = 0;
+  size_t len;
+  while ((len = fread(buf, 1, sizeof(buf), f)) > 0) {
+    PMurHash32_Process(&h1, &carry, buf, len);
+    total_len += len;
+  }
+  if (ferror(f)) {
+    err->assign(strerror(errno));  // XXX errno?
+    fclose(f);
+    return OtherError;
+  }
+  *hash = PMurHash32_Result(h1, carry, total_len);
+  fclose(f);
+  return Okay;
 }
 
 int RealDiskInterface::RemoveFile(const string& path) {

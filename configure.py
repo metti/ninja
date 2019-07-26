@@ -525,6 +525,7 @@ else:
     objs += cxx('subprocess-posix')
 if platform.is_aix():
     objs += cc('getopt')
+objs += cc('PMurHash')
 if platform.is_msvc():
     ninja_lib = n.build(built('ninja.lib'), 'ar', objs)
 else:

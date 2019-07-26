@@ -19,6 +19,7 @@
 #include <windows.h>
 #endif
 
+#include "PMurHash.h"
 #include "disk_interface.h"
 #include "graph.h"
 #include "test.h"
@@ -211,6 +212,22 @@ TEST_F(DiskInterfaceTest, RemoveFile) {
   EXPECT_EQ(1, disk_.RemoveFile("does not exist"));
 }
 
+TEST_F(DiskInterfaceTest, HashFile) {
+  const char* kFileName  = "file-to-hash";
+  const char kTestCont[] = "test-content";
+  DiskInterface::Hash hash = 42;
+  string err;
+
+  ASSERT_EQ(DiskInterface::NotFound, disk_.HashFile(kFileName, &hash, &err));
+  ASSERT_FALSE(err.empty());
+  ASSERT_EQ(42, hash);
+
+  err.clear();
+  ASSERT_TRUE(disk_.WriteFile(kFileName, kTestCont));
+  ASSERT_EQ(DiskInterface::Okay, disk_.HashFile(kFileName, &hash, &err));
+  ASSERT_EQ(PMurHash32(0, kTestCont, sizeof(kTestCont) - 1), hash);
+}
+
 struct StatTest : public StateTestWithBuiltinRules,
                   public DiskInterface {
   StatTest() : scan_(&state_, NULL, NULL, this, NULL) {}
@@ -232,6 +249,10 @@ struct StatTest : public StateTestWithBuiltinRules,
   virtual int RemoveFile(const string& path) {
     assert(false);
     return 0;
+  }
+  virtual Status HashFile(const string& path, Hash* hash, string* err) {
+    assert(false);
+    return NotFound;
   }
 
   DependencyScan scan_;
