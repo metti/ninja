@@ -128,6 +128,7 @@ struct NinjaMain : public BuildLogUser {
   int ToolCommands(const Options* options, int argc, char* argv[]);
   int ToolClean(const Options* options, int argc, char* argv[]);
   int ToolCompilationDatabase(const Options* options, int argc, char* argv[]);
+  int ToolHashes(const Options* options, int argc, char* argv[]);
   int ToolRecompact(const Options* options, int argc, char* argv[]);
   int ToolUrtle(const Options* options, int argc, char** argv);
   int ToolRules(const Options* options, int argc, char* argv[]);
@@ -532,6 +533,86 @@ int NinjaMain::ToolDeps(const Options* options, int argc, char** argv) {
   return 0;
 }
 
+int NinjaMain::ToolHashes(const Options* options, int argc, char* argv[]) {
+  if (!state_.need_hash_log_) {
+    printf("hash log not enabled\n");
+    return 0;
+  }
+
+  string err;
+  vector<Node*> nodes;
+  if (argc == 0) {
+    nodes = hash_log_.GetOutputs();
+  } else {
+    if (!CollectTargetsFromArgs(argc, argv, &nodes, &err)) {
+      Error("%s", err.c_str());
+      return 1;
+    }
+  }
+
+  ImplicitDepLoader dep_loader(&state_, &deps_log_,
+                               &disk_interface_,
+                               &config_.depfile_parser_options);
+
+  for (vector<Node*>::iterator i = nodes.begin(), end = nodes.end();
+       i != end; ++i) {
+    Edge *edge = (*i)->in_edge();
+
+    // In order to report on the hashes of the deps they need to be loaded.
+    if (!edge || !dep_loader.LoadDeps(edge, &err)) {
+      if (!err.empty())
+        Error("%s", err.c_str());
+      printf("%s: deps not found\n", (*i)->path().c_str());
+      continue;
+    }
+
+    printf("%s: #hashes %u\n", (*i)->path().c_str(), (unsigned)hash_log_.GetInputCount(*i));
+
+    bool is_clean = true;
+
+    for (vector<Node*>::const_iterator j = edge->inputs_.begin();
+        j != edge->inputs_.end() - edge->order_only_deps_; ++j) {
+      printf("    %s ", (*j)->path().c_str());
+
+      HashLog::HashRecord *hash = hash_log_.GetInputHash(*i, *j);
+
+      if (!hash) {
+        printf("UNKNOWN\n");
+        is_clean = false;
+        continue;
+      }
+
+      TimeStamp mtime = disk_interface_.Stat((*j)->path(), &err);
+      if (mtime == -1) {
+        printf("ERROR: %s\n", err.c_str());
+        is_clean = false;
+        continue;
+      }
+
+      DiskInterface::Hash hash_value;
+
+      if (disk_interface_.HashFile((*j)->path(), &hash_value, &err) == DiskInterface::OtherError) {
+        printf("ERROR: %s\n", err.c_str());
+        is_clean = false;
+        continue;
+      }
+
+      printf("hash mtime %ld (%s), hash value %08x (%s)\n",
+             hash->mtime_,
+             mtime == 0 ? "MISSING" :
+             mtime > hash->mtime_ ? "STALE" : "VALID",
+             hash->value_,
+             hash_value == hash->value_ ? "CLEAN" : "DIRTY");
+    }
+
+    if (is_clean)
+      printf("    CLEAN\n");
+    else
+      printf("    DIRTY\n");
+  }
+
+  return 0;
+}
 int NinjaMain::ToolTargets(const Options* options, int argc, char* argv[]) {
   int depth = 1;
   if (argc >= 1) {
@@ -894,6 +975,8 @@ const Tool* ChooseTool(const string& tool_name) {
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolCommands },
     { "deps", "show dependencies stored in the deps log",
       Tool::RUN_AFTER_LOGS, &NinjaMain::ToolDeps },
+    { "hashes", "show hashes stored in the hash log",
+      Tool::RUN_AFTER_LOGS, &NinjaMain::ToolHashes },
     { "graph", "output graphviz dot file for targets",
       Tool::RUN_AFTER_LOAD, &NinjaMain::ToolGraph },
     { "query", "show inputs/outputs for a path",
